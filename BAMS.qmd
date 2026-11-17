@@ -1,0 +1,1583 @@
+---
+title: "BAMModels"
+format: docx
+editor: visual
+---
+
+## BAM fitting to estimate dZ-Z curves for different management
+
+to evaluate the current geomorphic changes at the different management sites, we made the Z-ΔZ plots comparing the 2016 (2018 for dunes) data to the 2022 data. We computed the elevation change (ΔZ) pixelwise per mapped polygon and grouped them per management method. The Z-ΔZ curve was fitted to the data by using a generalized additive model for very large datasets (Bam function from the mcvg-package). The model is fitted using the “scat”-family (student-t distribution), which is often used for heavily tailed response variables (such as elevation data). After the fitting, we average the model over the polygons to obtain a population-level smooth per management. The model now represent a mean trend for both managements and can show averaged geomorphic changes.
+
+## Dunes
+
+```{r}
+#| echo: false
+# ============================================================
+# Libraries
+# ============================================================
+library(terra)
+library(tidyterra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(mgcv)
+library(gratia)
+library(patchwork)
+library(matrixStats)
+
+# ============================================================
+# 1. Load polygons
+# ============================================================
+poly_nbs  <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Single_NBS/Notches_all.shp")
+poly_conv <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Single_NBS/Control_notches_all.shp")
+
+poly_nbs$Management  <- "NBS"
+poly_conv$Management <- "Conventional"
+
+poly_nbs$ID  <- seq_len(nrow(poly_nbs))
+poly_conv$ID <- seq_len(nrow(poly_conv)) + nrow(poly_nbs)
+
+polys <- rbind(poly_nbs, poly_conv)
+
+# ============================================================
+# 2. Load DEMs
+# ============================================================
+dem_paths <- list(
+  "2010" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2010.tif",
+  "2011" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2011.tif",
+  "2012" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2012.tif",
+  "2013" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2013.tif",
+  "2014" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2014.tif",
+  "2015" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2015.tif",
+  "2016" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2016.tif",
+  "2017" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2017.tif",
+  "2018" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2018.tif",
+  "2019" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2019.tif",
+  "2020" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2020.tif",
+  "2021" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2021.tif",
+  "2022" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2022.tif"
+)
+
+dems <- map(dem_paths, rast)
+
+# ============================================================
+# 3. Extract pixel values
+# ============================================================
+extract_list <- map(names(dems), function(year) {
+  dem    <- dems[[year]]
+  vals   <- terra::extract(dem, polys)
+  valcol <- setdiff(colnames(vals), "ID")
+  vals   <- vals %>% rename(elev = all_of(valcol))
+  vals$year <- year
+  vals
+})
+
+dat <- bind_rows(extract_list) %>%
+  left_join(polys |> as.data.frame() |> select(ID, Management), by = "ID") %>%
+  filter(!is.na(elev))
+
+# ============================================================
+# 4. Pixel-wise OLS slope (2016-2022), z = 2016 elevation
+# ============================================================
+years_use <- 2016:2022
+
+wide_df <- dat %>%
+  filter(year %in% as.character(years_use)) %>%
+  mutate(year_num = as.numeric(year)) %>%
+  group_by(ID, Management, year_num) %>%
+  mutate(pixel_idx = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols     = c(ID, Management, pixel_idx),
+    names_from  = year_num,
+    values_from = elev
+  ) %>%
+  as.data.frame()
+
+elev_mat <- wide_df %>%
+  select(all_of(as.character(years_use))) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+x          <- years_use - mean(years_use)
+ss_x       <- sum(x^2)
+ols_slopes <- (elev_mat - rowMeans(elev_mat)) %*% x / ss_x
+
+pixel_data <- wide_df %>%
+  mutate(
+    dz = as.numeric(ols_slopes),
+    z  = as.numeric(`2016`)
+  ) %>%
+  select(ID, Management, dz, z) %>%
+  filter(!is.na(dz), !is.na(z)) %>%
+  mutate(ID = factor(ID), Management = factor(Management))  # ID factor added
+# Note: ID kept for normalisation grouping, not used in model
+
+# Min-max normalise z within each polygon
+# (preserves relative elevation structure while making polygons comparable)
+pixel_data <- pixel_data %>%
+  group_by(ID) %>%
+  mutate(z = (z - min(z, na.rm = TRUE)) /
+               (max(z, na.rm = TRUE) - min(z, na.rm = TRUE))) %>%
+  ungroup()
+
+# ============================================================
+# 4b renaming
+# ============================================================
+pixel_sub <- pixel_data
+
+# ============================================================
+# 5. CDF difference of normalised 2016 elevation by Management
+# ============================================================
+pixel_NBS  <- pixel_sub %>% filter(Management == "NBS")          %>% pull(z)
+pixel_Conv <- pixel_sub %>% filter(Management == "Conventional") %>% pull(z)
+
+cdf_NBS  <- ecdf(pixel_NBS)
+cdf_Conv <- ecdf(pixel_Conv)
+
+z_seq    <- seq(0, 1, length.out = 1000)   # z is now [0,1] after normalisation
+cdf_diff <- cdf_NBS(z_seq) - cdf_Conv(z_seq)
+cumulative_deficit <- cumsum(cdf_diff * mean(diff(z_seq)))
+
+cdf_df <- data.frame(
+  z                  = z_seq,
+  CDF_diff           = cdf_diff,
+  cumulative_deficit = cumulative_deficit
+)
+
+max_deficit_m <- abs(cdf_df$cumulative_deficit[nrow(cdf_df)])
+
+top_plot <- ggplot(cdf_df, aes(x = z, y = CDF_diff)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = CDF_diff, ymax = 0),
+              fill = "red", alpha = 0.3,
+              data = subset(cdf_df, CDF_diff < 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "CDF Difference (NBS - Conventional)",
+       x = NULL, y = "CDF Difference") +
+  theme_minimal(base_size = 14)
+
+bottom_plot <- ggplot(cdf_df, aes(x = z, y = cumulative_deficit)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  annotate("text",
+           x     = 0.02,
+           y     = cdf_df$cumulative_deficit[nrow(cdf_df)],
+           label = paste0("Mean elevation deficit = ", round(max_deficit_m, 3)),
+           hjust = 0, vjust = -0.5, color = "blue") +
+  labs(title = "Cumulative Elevation Deficit",
+       x = "Normalised elevation z (2016)", y = "Cumulative Deficit") +
+  theme_minimal(base_size = 14)
+
+print(top_plot / bottom_plot + plot_layout(heights = c(2, 1)))
+
+# ============================================================
+# 6. BAM: separate smooths per management via by=
+# ============================================================
+
+# Main model — by= gives each management type its own smooth
+# + Management provides the intercepts for each level
+bam_dunes <- bam(
+  dz ~ s(z, by = Management) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# Null model: shared smooth, management intercept only
+m_null_dunes <- bam(
+  dz ~ s(z) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# ── Model summary ─────────────────────────────────────────────
+summary(bam_dunes)
+
+# ── gratia: model appraisal ───────────────────────────────────
+
+# 1. Draw smooths with residuals overlaid
+draw(bam_dunes, residuals = TRUE) &
+  theme_minimal(base_size = 13)
+
+# 2. Residual diagnostics — simulation-based QQ for scat()
+appraise(bam_dunes, method = "simulate")
+
+# 3. Concurvity check
+concrvity(bam_dunes)
+
+# 4. Smooth estimates with simultaneous confidence intervals
+sm <- smooth_estimates(bam_dunes) |> add_confint()
+draw(sm)
+
+# 5. Derivatives — where along normalised z is dz changing significantly?
+deriv_Conv <- derivatives(
+  bam_dunes,
+  term = "s(z):ManagementConventional",
+  data = pixel_sub |> filter(Management == "Conventional")
+)
+deriv_NBS <- derivatives(
+  bam_dunes,
+  term = "s(z):ManagementNBS",
+  data = pixel_sub |> filter(Management == "NBS")
+)
+
+draw(deriv_Conv) + labs(title = "Derivative of s(z) - Conventional")
+draw(deriv_NBS)  + labs(title = "Derivative of s(z) - NBS")
+
+# 6. LRT model comparison
+anova(m_null_dunes, bam_dunes, test = "Chisq")
+
+# 7. Fallback QQ if appraise() spike reappears
+qq.gam(bam_dunes, rep = 100, method = "simulate")
+
+# ============================================================
+# 7. Prediction grid — averaged over polygon random effects
+# ============================================================
+z_seq_pred <- seq(0, 1, length.out = 1000)
+
+pred_grid <- expand.grid(
+  z          = z_seq_pred,
+  Management = levels(pixel_sub$Management),
+  ID         = levels(pixel_sub$ID)
+) %>%
+  mutate(
+    Management = factor(Management, levels = levels(pixel_sub$Management)),
+    ID         = factor(ID,         levels = levels(pixel_sub$ID))
+  )
+
+pred <- predict(bam_dunes, newdata = pred_grid, type = "response", se.fit = TRUE)
+pred_grid$fit <- pred$fit
+pred_grid$se  <- pred$se.fit
+
+pred_avg <- pred_grid %>%
+  group_by(Management, z) %>%
+  summarise(
+    fit = mean(fit),
+    se  = sqrt(mean(se^2)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    upper = fit + 2 * se,
+    lower = fit - 2 * se
+  )
+# ============================================================
+# 8. Residuals
+# ============================================================
+pixel_sub$resid <- residuals(bam_dunes)
+
+pixel_var_resid <- pixel_sub %>%
+  group_by(Management) %>%
+  summarise(
+    var_resid = var(resid),
+    sd_resid  = sd(resid),
+    n         = n(),
+    .groups   = "drop"
+  )
+print(pixel_var_resid)
+
+fligner.test(resid ~ Management, data = pixel_sub)
+
+ggplot(pixel_sub, aes(fitted(bam_dunes), abs(resid))) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  labs(x = "Fitted values", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+ggplot(pixel_sub, aes(z, abs(resid), color = Management)) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  scale_color_manual(values = c("NBS" = "#03A9FF", "Conventional" = "#FFBB03")) +
+  labs(x = "Normalised elevation z (2016)", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# 9. ECDF of 2022 elevation with crossing points
+# Note: 2022 elevation kept in raw metres (not normalised)
+# ============================================================
+elev_2022 <- wide_df %>%
+  mutate(elev_2022 = as.numeric(`2022`)) %>%
+  select(ID, Management, elev_2022) %>%
+  filter(!is.na(elev_2022)) %>%
+  mutate(Management = factor(Management))
+
+pixel_NBS_2022  <- elev_2022 %>% filter(Management == "NBS")          %>% pull(elev_2022)
+pixel_Conv_2022 <- elev_2022 %>% filter(Management == "Conventional") %>% pull(elev_2022)
+
+cdf_NBS_2022  <- ecdf(pixel_NBS_2022)
+cdf_Conv_2022 <- ecdf(pixel_Conv_2022)
+
+z_vals    <- seq(min(c(pixel_NBS_2022, pixel_Conv_2022)),
+                 max(c(pixel_NBS_2022, pixel_Conv_2022)),
+                 length.out = 1000)
+diff_cdf  <- cdf_NBS_2022(z_vals) - cdf_Conv_2022(z_vals)
+cross_idx <- which(diff_cdf[-1] * diff_cdf[-length(diff_cdf)] < 0)
+
+cross_points <- sapply(cross_idx, function(i) {
+  x1 <- z_vals[i];   x2 <- z_vals[i + 1]
+  y1 <- diff_cdf[i]; y2 <- diff_cdf[i + 1]
+  x1 - y1 * (x2 - x1) / (y2 - y1)
+})
+
+cross_table <- data.frame(
+  z_cross   = cross_points,
+  cdf_value = cdf_NBS_2022(cross_points)
+)
+print(cross_table)
+
+ecdf_plot_2022 <- ggplot(elev_2022, aes(x = elev_2022, color = Management)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(values = c("NBS" = "#03A9FF", "Conventional" = "#FFBB03")) +
+  geom_point(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points)),
+    aes(x = z, y = y), color = "red", size = 3, shape = 21, fill = "yellow",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points),
+                      label = round(cross_points, 2)),
+    aes(x = z, y = y, label = label),
+    vjust = -1, color = "red", size = 3, inherit.aes = FALSE
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(title = "ECDF of Pixel Elevation z (2022) by Management",
+       x = "Elevation z (2022) [m]", y = "Cumulative proportion",
+       color = "Management") +
+  theme(legend.position = "top")
+
+print(ecdf_plot_2022)
+
+# ============================================================
+# 10. Bin comparison table — bins on normalised z [0,1]
+# ============================================================
+bin_compare_table <- pred_avg %>%
+  mutate(z_bin = floor(z / 0.1) * 0.1) %>%   # 0.1 bins on [0,1] scale
+  group_by(Management, z_bin) %>%
+  summarise(mean_dz = mean(fit), .groups = "drop") %>%
+  pivot_wider(names_from = Management, values_from = mean_dz) %>%
+  mutate(
+    diff_NBS_minus_Conv = NBS - Conventional,
+    Advantage = case_when(
+      diff_NBS_minus_Conv > 0 ~ "NBS higher accretion",
+      diff_NBS_minus_Conv < 0 ~ "Conventional higher accretion",
+      TRUE                    ~ "Equal"
+    )
+  ) %>%
+  arrange(z_bin)
+print(bin_compare_table)
+
+# ============================================================
+# 11. Trapezoidal integration
+# ============================================================
+curve_wide <- pred_avg %>%
+  select(z, Management, fit) %>%
+  pivot_wider(names_from = Management, values_from = fit) %>%
+  arrange(z)
+
+z_step <- diff(curve_wide$z)
+
+I_NBS  <- sum((curve_wide$NBS[-1]          + curve_wide$NBS[-nrow(curve_wide)])          / 2 * z_step)
+I_Conv <- sum((curve_wide$Conventional[-1] + curve_wide$Conventional[-nrow(curve_wide)]) / 2 * z_step)
+z_range <- diff(range(curve_wide$z))   # = 1 after normalisation
+
+integral_table <- data.frame(
+  Management          = c("NBS", "Conventional"),
+  Integral            = round(c(I_NBS, I_Conv), 4),
+  Normalized_integral = round(c(I_NBS / z_range, I_Conv / z_range), 4)
+)
+print(integral_table)
+
+diff_table <- data.frame(
+  Metric = c("Integral difference (NBS - Conv)", "Normalized difference (NBS - Conv)",
+             "Integral ratio (NBS / Conv)",      "Normalized ratio (NBS / Conv)"),
+  Value  = round(c(I_NBS - I_Conv,
+                   I_NBS / z_range - I_Conv / z_range,
+                   I_NBS / I_Conv,
+                   (I_NBS / z_range) / (I_Conv / z_range)), 4)
+)
+print(diff_table)
+
+# ============================================================
+# 12. Final combined plot — x-axis now normalised [0,1]
+# ============================================================
+bin_width <- 0.1         # bins on normalised scale
+xmin      <- 0
+xmax      <- 1
+slr_m     <- 2.9 / 1000
+colors    <- c("Dunes" = "#FFBB03", "NBS" = "#03A9FF")
+
+pred_avg_plot <- pred_avg %>%
+  mutate(Management = recode(Management, "Conventional" = "Dunes"))
+
+pixel_sub_plot <- pixel_sub %>%
+  mutate(Management = recode(Management, "Conventional" = "Dunes")) %>%
+  mutate(
+    z_bin      = floor(z / bin_width) * bin_width,
+    bin_center = z_bin + bin_width / 2,
+    bin_factor = factor(bin_center)
+  )
+
+x_ticks <- seq(xmin, xmax, by = 0.1)
+
+x_grid_theme <- theme(
+  panel.grid.major.x = element_line(colour = "grey80", linewidth = 0.4),
+  panel.grid.minor   = element_blank()
+)
+
+# ── Top panel: BAM curves ─────────────────────────────────────
+bam_curve_plot <- ggplot(pred_avg_plot,
+                         aes(x = z, y = fit, color = Management, fill = Management)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.25, colour = NA) +
+  geom_line(linewidth = 1.3) +
+  geom_hline(yintercept = 0,     linewidth = 0.9, colour = "black") +
+  geom_hline(yintercept = slr_m, linewidth = 0.9, colour = "red", linetype = "dashed") +
+  annotate("text", x = xmax, y = slr_m,
+           label = "Current SLR = 2.9 mm yr\u207b\u00b9",
+           colour = "red", hjust = 1, vjust = -0.6, size = 4) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values  = colors) +
+  coord_cartesian(ylim = c(-0.05, 0.22), xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0),
+                     labels = scales::number_format(accuracy = 0.1)) +
+  scale_y_reverse() +
+  labs(y = expression(Delta * "Z (m yr"^-1 * ")"), x = NULL) +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position    = "top",
+    axis.text.x        = element_blank(),
+    axis.ticks.x       = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    plot.margin        = margin(5, 5, 10, 5)
+  )
+
+# ── Middle panel: residual boxplots ───────────────────────────
+resid_boxplot <- ggplot(pixel_sub_plot,
+                        aes(x = bin_center, y = resid,
+                            group = interaction(bin_factor, Management),
+                            fill  = Management)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6, colour = "grey40") +
+  geom_boxplot(
+    position      = position_dodge(width = bin_width * 0.9),
+    width         = bin_width * 0.8,
+    linewidth     = 0.4,
+    outlier.shape = NA,
+    alpha         = 0.85
+  ) +
+  scale_fill_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0),
+                     labels = scales::number_format(accuracy = 0.1)) +
+  scale_y_reverse(breaks = scales::pretty_breaks(n = 4)) +
+  labs(x = NULL, y = "Residuals (m/year)") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    plot.margin     = margin(5, 5, 10, 5)
+  )
+
+# ── Bottom panel: density ─────────────────────────────────────
+pdf_plot <- ggplot(pixel_sub_plot,
+                   aes(x = z, fill = Management, colour = Management)) +
+  geom_density(alpha = 0.25, linewidth = 1.0) +
+  scale_fill_manual(values  = colors) +
+  scale_color_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0),
+                     labels = scales::number_format(accuracy = 0.1)) +
+  scale_y_reverse() +
+  labs(x = "Normalised elevation z (2016) [0-1]", y = "Density") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(size = 9),
+    plot.margin     = margin(5, 5, 5, 5)
+  )
+
+# ── Combine ───────────────────────────────────────────────────
+combined_plot <- bam_curve_plot /
+                 resid_boxplot  /
+                 pdf_plot +
+                 plot_layout(heights = c(2, 1, 0.8))
+
+combined_plot
+
+# ============================================================
+# 12b. Density-weighted mean dz per management
+# ============================================================
+
+dens_NBS  <- density(pixel_sub_plot %>% filter(Management == "NBS")   %>% pull(z),
+                     from = 0, to = 1, n = 1000)
+dens_Conv <- density(pixel_sub_plot %>% filter(Management == "Dunes") %>% pull(z),
+                     from = 0, to = 1, n = 1000)
+
+dz_NBS  <- pred_avg_plot %>% filter(Management == "NBS")   %>% arrange(z) %>% pull(fit)
+dz_Conv <- pred_avg_plot %>% filter(Management == "Dunes") %>% arrange(z) %>% pull(fit)
+
+w_NBS  <- dens_NBS$y  / sum(dens_NBS$y)
+w_Conv <- dens_Conv$y / sum(dens_Conv$y)
+
+mean_dz_NBS  <- sum(dz_NBS  * w_NBS)  * 1000   # now mm/yr
+mean_dz_Conv <- sum(dz_Conv * w_Conv) * 1000   # now mm/yr
+
+weighted_mean_table <- data.frame(
+  Management         = c("NBS", "Conventional"),
+  Mean_dz_mm_yr      = round(c(mean_dz_NBS, mean_dz_Conv), 2),
+  Mean_dz_unweighted = round(c(mean(dz_NBS * 1000), mean(dz_Conv * 1000)), 2),
+  SLR_mm_yr          = 2.9,
+  Surplus_vs_SLR     = round(c(mean_dz_NBS, mean_dz_Conv) - 2.9, 2)
+)
+print(weighted_mean_table)
+
+cat("\n=== Density-weighted mean accretion rates ===\n")
+cat("Conventional:", round(mean_dz_Conv, 2), "mm/yr\n")
+cat("NBS:         ", round(mean_dz_NBS,  2), "mm/yr\n")
+cat("SLR:          2.9 mm/yr\n")
+cat("---------------------------------------------\n")
+cat("NBS surplus vs SLR:  ", round(mean_dz_NBS  - 2.9, 2), "mm/yr\n")
+cat("Conv surplus vs SLR: ", round(mean_dz_Conv - 2.9, 2), "mm/yr\n")
+cat("Difference (NBS - Conv):", round(mean_dz_NBS - mean_dz_Conv, 2), "mm/yr\n")
+```
+
+## Overwash
+
+```{R}
+#| echo: false
+# ============================================================
+# Libraries
+# ============================================================
+library(terra)
+library(tidyterra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(mgcv)
+library(gratia)
+library(patchwork)
+library(matrixStats)
+
+# ============================================================
+# 1. Load polygons
+# ============================================================
+poly_nbs  <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Single_NBS/Nature_overwashes_activeZ.shp")
+poly_conv <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Single_NBS/Stuifdijk_overwashes_activeZ.shp")
+
+poly_nbs$Management  <- "NBS"
+poly_conv$Management <- "Conventional"
+
+poly_nbs$ID  <- seq_len(nrow(poly_nbs))
+poly_conv$ID <- seq_len(nrow(poly_conv)) + nrow(poly_nbs)
+
+polys <- rbind(poly_nbs, poly_conv)
+
+# ============================================================
+# 2. Load DEMs
+# ============================================================
+dem_paths <- list(
+  "2010" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2010.tif",
+  "2011" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2011.tif",
+  "2012" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2012.tif",
+  "2013" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2013.tif",
+  "2014" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2014.tif",
+  "2015" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2015.tif",
+  "2016" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2016.tif",
+  "2017" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2017.tif",
+  "2018" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2018.tif",
+  "2019" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2019.tif",
+  "2020" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2020.tif",
+  "2021" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2021.tif",
+  "2022" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2022.tif"
+)
+
+dems <- map(dem_paths, rast)
+
+# ============================================================
+# 3. Extract pixel values
+# ============================================================
+extract_list <- map(names(dems), function(year) {
+  dem    <- dems[[year]]
+  vals   <- terra::extract(dem, polys)
+  valcol <- setdiff(colnames(vals), "ID")
+  vals   <- vals %>% rename(elev = all_of(valcol))
+  vals$year <- year
+  vals
+})
+
+dat <- bind_rows(extract_list) %>%
+  left_join(polys |> as.data.frame() |> select(ID, Management), by = "ID") %>%
+  filter(!is.na(elev))
+
+# ============================================================
+# 4. Pixel-wise OLS slope (2016-2022), z = 2016 elevation
+# ============================================================
+years_use <- 2016:2022
+
+wide_df <- dat %>%
+  filter(year %in% as.character(years_use)) %>%
+  mutate(year_num = as.numeric(year)) %>%
+  group_by(ID, Management, year_num) %>%
+  mutate(pixel_idx = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols     = c(ID, Management, pixel_idx),
+    names_from  = year_num,
+    values_from = elev
+  ) %>%
+  as.data.frame()
+
+elev_mat <- wide_df %>%
+  select(all_of(as.character(years_use))) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+x        <- years_use - mean(years_use)
+ss_x     <- sum(x^2)
+ols_slopes <- (elev_mat - rowMeans(elev_mat)) %*% x / ss_x
+
+pixel_data <- wide_df %>%
+  mutate(
+    dz = as.numeric(ols_slopes),
+    z  = as.numeric(`2016`)
+  ) %>%
+  select(ID, Management, dz, z) %>%
+  filter(!is.na(dz), !is.na(z)) %>%
+  mutate(ID = factor(ID), Management = factor(Management))  
+
+# ============================================================
+# 4b. 
+# ============================================================
+pixel_sub <- pixel_data
+
+# ============================================================
+# 5. CDF difference of 2016 elevation (z) by Management
+# ============================================================
+pixel_NBS  <- pixel_sub %>% filter(Management == "NBS")          %>% pull(z)
+pixel_Conv <- pixel_sub %>% filter(Management == "Conventional") %>% pull(z)
+
+cdf_NBS  <- ecdf(pixel_NBS)
+cdf_Conv <- ecdf(pixel_Conv)
+
+z_seq    <- seq(min(pixel_sub$z), max(pixel_sub$z), length.out = 1000)
+cdf_diff <- cdf_NBS(z_seq) - cdf_Conv(z_seq)
+cumulative_deficit <- cumsum(cdf_diff * mean(diff(z_seq)))
+
+cdf_df <- data.frame(
+  z                  = z_seq,
+  CDF_diff           = cdf_diff,
+  cumulative_deficit = cumulative_deficit
+)
+
+max_deficit_m <- cdf_df$cumulative_deficit[nrow(cdf_df)]
+
+
+
+
+top_plot <- ggplot(cdf_df, aes(x = z, y = CDF_diff)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = CDF_diff, ymax = 0),
+              fill = "red", alpha = 0.3,
+              data = subset(cdf_df, CDF_diff < 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "CDF Difference (NBS - Conventional)", x = NULL, y = "CDF Difference") +
+  theme_minimal(base_size = 14)
+
+bottom_plot <- ggplot(cdf_df, aes(x = z, y = cumulative_deficit)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  annotate("text",
+           x     = min(cdf_df$z) + 0.2,
+           y     = cdf_df$cumulative_deficit[nrow(cdf_df)],
+           label = paste0("Mean elevation difference (NBS - Conv) = ", round(max_deficit_m, 3), " m"),
+           hjust = 0, vjust = -0.5, color = "blue") +
+  labs(title = "Cumulative Elevation Deficit",
+       x = "Elevation (m)", y = "Cumulative Deficit (m)") +
+  theme_minimal(base_size = 14)
+
+print(top_plot / bottom_plot + plot_layout(heights = c(2, 1)))
+
+# ============================================================
+# 6. BAM: separate smooths per management via by=
+# ============================================================
+
+# Main model
+bam_overwash <- bam(
+  dz ~ s(z, by = Management) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# Null model: shared smooth, management intercept only
+m_null_overwash <- bam(
+  dz ~ s(z) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# ── Model summary ─────────────────────────────────────────────
+summary(bam_overwash)
+
+# ── gratia: model appraisal ───────────────────────────────────
+
+# 1. Smooth terms with residuals overlaid
+draw(bam_overwash, residuals = TRUE) &
+  theme_minimal(base_size = 13)
+
+# 2. Residual diagnostics — simulation-based QQ more reliable for scat()
+appraise(bam_overwash, method = "simulate")
+
+# 3. Concurvity check
+concrvity(bam_overwash)
+
+# 4. Smooth estimates with simultaneous confidence intervals
+sm <- smooth_estimates(bam_overwash) |> add_confint()
+draw(sm)
+
+# 5. Derivatives — where along z is accretion rate significantly changing?
+deriv_Conv <- derivatives(
+  bam_overwash,
+  term = "s(z):ManagementConventional",
+  data = pixel_sub |> filter(Management == "Conventional")
+)
+deriv_NBS <- derivatives(
+  bam_overwash,
+  term = "s(z):ManagementNBS",
+  data = pixel_sub |> filter(Management == "NBS")
+)
+
+draw(deriv_Conv) + labs(title = "Derivative of s(z) - Conventional")
+draw(deriv_NBS)  + labs(title = "Derivative of s(z) - NBS")
+
+# 6. Model comparison LRT
+anova(m_null_overwash, bam_overwash, test = "Chisq")
+
+# 7. Fallback QQ if appraise() spike reappears
+qq.gam(bam_overwash, rep = 100, method = "simulate")
+
+# ============================================================
+# 7. Prediction grid — averaged over polygon random effects
+# ============================================================
+z_seq_pred <- seq(min(pixel_sub$z), max(pixel_sub$z), length.out = 1000)
+
+pred_grid <- expand.grid(
+  z          = z_seq_pred,
+  Management = levels(pixel_sub$Management),
+  ID         = levels(pixel_sub$ID)
+) %>%
+  mutate(
+    Management = factor(Management, levels = levels(pixel_sub$Management)),
+    ID         = factor(ID,         levels = levels(pixel_sub$ID))
+  )
+
+pred <- predict(bam_overwash, newdata = pred_grid, type = "response", se.fit = TRUE)
+pred_grid$fit <- pred$fit
+pred_grid$se  <- pred$se.fit
+
+pred_avg <- pred_grid %>%
+  group_by(Management, z) %>%
+  summarise(
+    fit = mean(fit),
+    se  = sqrt(mean(se^2)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    upper = fit + 2 * se,
+    lower = fit - 2 * se
+  )
+
+# ============================================================
+# 8. Residuals
+# ============================================================
+pixel_sub$resid <- residuals(bam_overwash)
+
+pixel_var_resid <- pixel_sub %>%
+  group_by(Management) %>%
+  summarise(
+    var_resid = var(resid),
+    sd_resid  = sd(resid),
+    n         = n(),
+    .groups   = "drop"
+  )
+print(pixel_var_resid)
+
+fligner.test(resid ~ Management, data = pixel_sub)
+
+ggplot(pixel_sub, aes(fitted(bam_overwash), abs(resid))) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  labs(x = "Fitted values", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+ggplot(pixel_sub, aes(z, abs(resid), color = Management)) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  scale_color_manual(values = c("NBS" = "#03A9FF", "Conventional" = "#FFBB03")) +
+  labs(x = "Elevation z (2016)", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# 9. ECDF of 2022 elevation with crossing points
+# ============================================================
+elev_2022 <- wide_df %>%
+  mutate(elev_2022 = as.numeric(`2022`)) %>%
+  select(ID, Management, elev_2022) %>%
+  filter(!is.na(elev_2022)) %>%
+  mutate(Management = factor(Management))
+
+pixel_NBS_2022  <- elev_2022 %>% filter(Management == "NBS")          %>% pull(elev_2022)
+pixel_Conv_2022 <- elev_2022 %>% filter(Management == "Conventional") %>% pull(elev_2022)
+
+cdf_NBS_2022  <- ecdf(pixel_NBS_2022)
+cdf_Conv_2022 <- ecdf(pixel_Conv_2022)
+
+z_vals   <- seq(min(c(pixel_NBS_2022, pixel_Conv_2022)),
+                max(c(pixel_NBS_2022, pixel_Conv_2022)),
+                length.out = 1000)
+diff_cdf <- cdf_NBS_2022(z_vals) - cdf_Conv_2022(z_vals)
+cross_idx <- which(diff_cdf[-1] * diff_cdf[-length(diff_cdf)] < 0)
+
+cross_points <- sapply(cross_idx, function(i) {
+  x1 <- z_vals[i];   x2 <- z_vals[i + 1]
+  y1 <- diff_cdf[i]; y2 <- diff_cdf[i + 1]
+  x1 - y1 * (x2 - x1) / (y2 - y1)
+})
+
+cross_table <- data.frame(
+  z_cross   = cross_points,
+  cdf_value = cdf_NBS_2022(cross_points)
+)
+print(cross_table)
+
+ecdf_plot_2022 <- ggplot(elev_2022, aes(x = elev_2022, color = Management)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(values = c("NBS" = "#03A9FF", "Conventional" = "#FFBB03")) +
+  geom_point(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points)),
+    aes(x = z, y = y), color = "red", size = 3, shape = 21, fill = "yellow",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points),
+                      label = round(cross_points, 2)),
+    aes(x = z, y = y, label = label),
+    vjust = -1, color = "red", size = 3, inherit.aes = FALSE
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(title = "ECDF of Pixel Elevation z (2022) by Management",
+       x = "Elevation z (2022) [m]", y = "Cumulative proportion",
+       color = "Management") +
+  theme(legend.position = "top")
+
+print(ecdf_plot_2022)
+
+# ============================================================
+# 10. Bin comparison table
+# ============================================================
+bin_compare_table <- pred_avg %>%
+  mutate(z_bin = floor(z / 0.5) * 0.5) %>%
+  group_by(Management, z_bin) %>%
+  summarise(mean_dz = mean(fit), .groups = "drop") %>%
+  pivot_wider(names_from = Management, values_from = mean_dz) %>%
+  mutate(
+    diff_NBS_minus_Conv = NBS - Conventional,
+    Advantage = case_when(
+      diff_NBS_minus_Conv > 0 ~ "NBS higher accretion",
+      diff_NBS_minus_Conv < 0 ~ "Conventional higher accretion",
+      TRUE                    ~ "Equal"
+    )
+  ) %>%
+  arrange(z_bin)
+print(bin_compare_table)
+
+# ============================================================
+# 11. Trapezoidal integration
+# ============================================================
+curve_wide <- pred_avg %>%
+  select(z, Management, fit) %>%
+  pivot_wider(names_from = Management, values_from = fit) %>%
+  arrange(z)
+
+z_step <- diff(curve_wide$z)
+
+I_NBS  <- sum((curve_wide$NBS[-1]          + curve_wide$NBS[-nrow(curve_wide)])          / 2 * z_step)
+I_Conv <- sum((curve_wide$Conventional[-1] + curve_wide$Conventional[-nrow(curve_wide)]) / 2 * z_step)
+z_range <- diff(range(curve_wide$z))
+
+integral_table <- data.frame(
+  Management          = c("NBS", "Conventional"),
+  Integral            = round(c(I_NBS, I_Conv), 4),
+  Normalized_integral = round(c(I_NBS / z_range, I_Conv / z_range), 4)
+)
+print(integral_table)
+
+diff_table <- data.frame(
+  Metric = c("Integral difference (NBS - Conv)", "Normalized difference (NBS - Conv)",
+             "Integral ratio (NBS / Conv)",      "Normalized ratio (NBS / Conv)"),
+  Value  = round(c(I_NBS - I_Conv,
+                   I_NBS / z_range - I_Conv / z_range,
+                   I_NBS / I_Conv,
+                   (I_NBS / z_range) / (I_Conv / z_range)), 4)
+)
+print(diff_table)
+
+# ============================================================
+# 12. Final combined plot
+# ============================================================
+bin_width <- 2.5
+xmin      <- -5
+xmax      <- 20
+slr_m     <- 2.9 / 1000
+colors    <- c("Artificial Sand Drift Dike" = "#FFBB03", "NBS" = "#03A9FF")
+
+pred_avg_plot <- pred_avg %>%
+  mutate(Management = recode(Management, "Conventional" = "Artificial Sand Drift Dike"))
+
+pixel_sub_plot <- pixel_sub %>%
+  mutate(Management = recode(Management, "Conventional" = "Artificial Sand Drift Dike")) %>%
+  mutate(
+    z_bin      = floor(z / bin_width) * bin_width,
+    bin_center = z_bin + bin_width / 2,
+    bin_factor = factor(bin_center)
+  )
+
+x_ticks <- seq(xmin, xmax, by = 2.5)
+
+x_grid_theme <- theme(
+  panel.grid.major.x = element_line(colour = "grey80", linewidth = 0.4),
+  panel.grid.minor   = element_blank()
+)
+
+# ── Top panel: BAM curves ─────────────────────────────────────
+bam_curve_plot <- ggplot(pred_avg_plot,
+                         aes(x = z, y = fit, color = Management, fill = Management)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.25, colour = NA) +
+  geom_line(linewidth = 1.3) +
+  geom_hline(yintercept = 0,     linewidth = 0.9, colour = "black") +
+  geom_hline(yintercept = slr_m, linewidth = 0.9, colour = "red", linetype = "dashed") +
+  annotate("text", x = xmax, y = slr_m,
+           label = "Current SLR = 2.9 mm yr\u207b\u00b9",
+           colour = "red", hjust = 1, vjust = -0.6, size = 4) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values  = colors) +
+  coord_cartesian(ylim = c(-0.01, 0.02), xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse() +
+  labs(y = expression(Delta * "Z (m yr"^-1 * ")"), x = NULL) +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position    = "top",
+    axis.text.x        = element_blank(),
+    axis.ticks.x       = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    plot.margin        = margin(5, 5, 10, 5)
+  )
+
+# ── Middle panel: residual boxplots ───────────────────────────
+resid_boxplot <- ggplot(pixel_sub_plot,
+                        aes(x = bin_center, y = resid,
+                            group = interaction(bin_factor, Management),
+                            fill  = Management)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6, colour = "grey40") +
+  geom_boxplot(
+    position      = position_dodge(width = bin_width * 0.9),
+    width         = bin_width * 0.8,
+    linewidth     = 0.4,
+    outlier.shape = NA,
+    alpha         = 0.85
+  ) +
+  scale_fill_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse(breaks = scales::pretty_breaks(n = 4)) +
+  labs(x = NULL, y = "Residuals (m/year)") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    plot.margin     = margin(5, 5, 10, 5)
+  )
+
+# ── Bottom panel: density ─────────────────────────────────────
+pdf_plot <- ggplot(pixel_sub_plot,
+                   aes(x = z, fill = Management, colour = Management)) +
+  geom_density(
+    aes(y = after_stat(density)),
+    alpha     = 0.25,
+    linewidth = 1.0,
+    position  = "identity"
+  ) +
+  scale_fill_manual(values  = colors) +
+  scale_color_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse() +
+  labs(x = "Elevation z (2016) [m]", y = "Normalized density") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(size = 9),
+    plot.margin     = margin(5, 5, 5, 5)
+  )
+
+# ── Combine ───────────────────────────────────────────────────
+combined_plot <- bam_curve_plot /
+                 resid_boxplot  /
+                 pdf_plot +
+                 plot_layout(heights = c(2, 1, 0.8))
+
+combined_plot
+
+# ============================================================
+# 12b. Density-weighted mean dz per management
+# ============================================================
+
+dens_NBS  <- density(pixel_sub_plot %>% filter(Management == "NBS")   %>% pull(z),
+                     from = 0, to = 10, n = 1000)
+dens_Conv <- density(pixel_sub_plot %>% filter(Management == "Artificial Sand Drift Dike") %>% pull(z),
+                     from = 0, to = 10, n = 1000)
+
+dz_NBS  <- pred_avg_plot %>% filter(Management == "NBS")   %>% arrange(z) %>% pull(fit)
+dz_Conv <- pred_avg_plot %>% filter(Management == "Artificial Sand Drift Dike") %>% arrange(z) %>% pull(fit)
+
+w_NBS  <- dens_NBS$y  / sum(dens_NBS$y)
+w_Conv <- dens_Conv$y / sum(dens_Conv$y)
+
+mean_dz_NBS  <- sum(dz_NBS  * w_NBS)  * 1000   # now mm/yr
+mean_dz_Conv <- sum(dz_Conv * w_Conv) * 1000   # now mm/yr
+
+weighted_mean_table <- data.frame(
+  Management         = c("NBS", "Artificial Sand Drift Dike"),
+  Mean_dz_mm_yr      = round(c(mean_dz_NBS, mean_dz_Conv), 2),
+  Mean_dz_unweighted = round(c(mean(dz_NBS * 1000), mean(dz_Conv * 1000)), 2),
+  SLR_mm_yr          = 2.9,
+  Surplus_vs_SLR     = round(c(mean_dz_NBS, mean_dz_Conv) - 2.9, 2)
+)
+print(weighted_mean_table)
+
+cat("\n=== Density-weighted mean accretion rates ===\n")
+cat("Artificial Sand Drift Dike:", round(mean_dz_Conv, 2), "mm/yr\n")
+cat("NBS:         ", round(mean_dz_NBS,  2), "mm/yr\n")
+cat("SLR:          2.9 mm/yr\n")
+cat("---------------------------------------------\n")
+cat("NBS surplus vs SLR:  ", round(mean_dz_NBS  - 2.9, 2), "mm/yr\n")
+cat("Artificial Sand Drift Dike surplus vs SLR: ", round(mean_dz_Conv - 2.9, 2), "mm/yr\n")
+cat("Difference (NBS - Conv):", round(mean_dz_NBS - mean_dz_Conv, 2), "mm/yr\n")
+
+```
+
+## Marshes
+
+```{r}
+#| echo: false
+
+# ============================================================
+# Libraries
+# ============================================================
+library(terra)
+library(tidyterra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(mgcv)
+library(gratia)
+library(patchwork)
+library(matrixStats)
+
+# ============================================================
+# 1. Load polygons
+# ============================================================
+poly_nbs  <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/polygons/EcotopeWS3_mp__SaltmarshesMulti_Barrier.shp")
+poly_conv <- vect("C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Single_NBS/Control_Saltmarshes_BarriersP.shp")
+
+poly_nbs$Management  <- "NBS"
+poly_conv$Management <- "Conventional"
+
+poly_nbs$ID  <- seq_len(nrow(poly_nbs))
+poly_conv$ID <- seq_len(nrow(poly_conv)) + nrow(poly_nbs)
+
+polys <- rbind(poly_nbs, poly_conv)
+
+# ============================================================
+# 2. Load DEMs
+# ============================================================
+dem_paths <- list(
+  "2010" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2010.tif",
+  "2011" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2011.tif",
+  "2012" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2012.tif",
+  "2013" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2013.tif",
+  "2014" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2014.tif",
+  "2015" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2015.tif",
+  "2016" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2016.tif",
+  "2017" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2017.tif",
+  "2018" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2018.tif",
+  "2019" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2019.tif",
+  "2020" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2020.tif",
+  "2021" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2021.tif",
+  "2022" = "C:/Users/6679242/OneDrive - Universiteit Utrecht/Documents/WADWAD/Data/Geodata/Accretion_vs_SLR/Rasters/Topography_2022.tif"
+)
+
+dems <- map(dem_paths, rast)
+
+# ============================================================
+# 3. Extract pixel values
+# ============================================================
+extract_list <- map(names(dems), function(year) {
+  dem    <- dems[[year]]
+  vals   <- terra::extract(dem, polys)
+  valcol <- setdiff(colnames(vals), "ID")
+  vals   <- vals %>% rename(elev = all_of(valcol))
+  vals$year <- year
+  vals
+})
+
+dat <- bind_rows(extract_list) %>%
+  left_join(polys |> as.data.frame() |> select(ID, Management), by = "ID") %>%
+  filter(!is.na(elev))
+
+# ============================================================
+# 4. Pixel-wise OLS slope (2016-2022), z = 2016 elevation
+# ============================================================
+years_use <- 2016:2022
+
+wide_df <- dat %>%
+  filter(year %in% as.character(years_use)) %>%
+  mutate(year_num = as.numeric(year)) %>%
+  group_by(ID, Management, year_num) %>%
+  mutate(pixel_idx = row_number()) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols     = c(ID, Management, pixel_idx),
+    names_from  = year_num,
+    values_from = elev
+  ) %>%
+  as.data.frame()
+
+elev_mat <- wide_df %>%
+  select(all_of(as.character(years_use))) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+x          <- years_use - mean(years_use)
+ss_x       <- sum(x^2)
+ols_slopes <- (elev_mat - rowMeans(elev_mat)) %*% x / ss_x
+
+pixel_data <- wide_df %>%
+  mutate(
+    dz = as.numeric(ols_slopes),
+    z  = as.numeric(`2016`)
+  ) %>%
+  select(ID, Management, dz, z) %>%
+  filter(!is.na(dz), !is.na(z)) %>%
+  mutate(ID = factor(ID), Management = factor(Management))
+
+# ============================================================
+# 4b. Elevation filter + zero filter
+# ============================================================
+pixel_sub <- pixel_data %>%
+  filter(z >= -0.5, z <= 3.5)
+
+# ============================================================
+# 5. CDF difference of 2016 elevation (z) by Management
+# ============================================================
+pixel_NBS  <- pixel_sub %>% filter(Management == "NBS")          %>% pull(z)
+pixel_Conv <- pixel_sub %>% filter(Management == "Conventional") %>% pull(z)
+
+cdf_NBS  <- ecdf(pixel_NBS)
+cdf_Conv <- ecdf(pixel_Conv)
+
+z_seq    <- seq(min(pixel_sub$z), max(pixel_sub$z), length.out = 1000)
+cdf_diff <- cdf_NBS(z_seq) - cdf_Conv(z_seq)
+cumulative_deficit <- cumsum(cdf_diff * mean(diff(z_seq)))
+
+cdf_df <- data.frame(
+  z                  = z_seq,
+  CDF_diff           = cdf_diff,
+  cumulative_deficit = cumulative_deficit
+)
+
+max_deficit_m <- abs(cdf_df$cumulative_deficit[nrow(cdf_df)])
+
+top_plot <- ggplot(cdf_df, aes(x = z, y = CDF_diff)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = CDF_diff, ymax = 0),
+              fill = "red", alpha = 0.3,
+              data = subset(cdf_df, CDF_diff < 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "CDF Difference (NBS - Conventional)",
+       x = NULL, y = "CDF Difference") +
+  theme_minimal(base_size = 14)
+
+bottom_plot <- ggplot(cdf_df, aes(x = z, y = cumulative_deficit)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  annotate("text",
+           x     = min(cdf_df$z) + 0.2,
+           y     = cdf_df$cumulative_deficit[nrow(cdf_df)],
+           label = paste0("Mean elevation deficit = ", round(max_deficit_m, 3), " m"),
+           hjust = 0, vjust = -0.5, color = "blue") +
+  labs(title = "Cumulative Elevation Deficit",
+       x = "Elevation (m)", y = "Cumulative Deficit (m)") +
+  theme_minimal(base_size = 14)
+
+print(top_plot / bottom_plot + plot_layout(heights = c(2, 1)))
+
+# ============================================================
+# 6. BAM: by= smooth per management + polygon random intercept
+# ============================================================
+
+# Main model — by= for separate smooths, s(ID, re) for polygon intercepts
+bam_marsh <- bam(
+  dz ~ s(z, by = Management) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# Null model — shared smooth, same random effect structure
+m_null_marsh <- bam(
+  dz ~ s(z) + Management + s(ID, bs = "re"),
+  data   = pixel_sub,
+  method = "REML",
+  family = scat()
+)
+
+# ── Model summary ─────────────────────────────────────────────
+summary(bam_marsh)
+
+# ── gratia: model appraisal ───────────────────────────────────
+
+# 1. Draw smooths with residuals overlaid
+draw(bam_marsh, residuals = TRUE) &
+  theme_minimal(base_size = 13)
+
+# 2. Residual diagnostics
+appraise(bam_marsh, method = "simulate")
+
+# 3. Concurvity check
+concrvity(bam_marsh)
+
+# 4. Smooth estimates with simultaneous confidence intervals
+sm <- smooth_estimates(bam_marsh) |> add_confint()
+draw(sm)
+
+# 5. Derivatives — where along z is accretion rate significantly changing?
+deriv_Conv <- derivatives(
+  bam_marsh,
+  term = "s(z):ManagementConventional",
+  data = pixel_sub |> filter(Management == "Conventional")
+)
+deriv_NBS <- derivatives(
+  bam_marsh,
+  term = "s(z):ManagementNBS",
+  data = pixel_sub |> filter(Management == "NBS")
+)
+
+draw(deriv_Conv) + labs(title = "Derivative of s(z) - Conventional (Embanked)")
+draw(deriv_NBS)  + labs(title = "Derivative of s(z) - NBS")
+
+# 6. LRT model comparison
+anova(m_null_marsh, bam_marsh, test = "Chisq")
+
+# 7. Fallback QQ
+qq.gam(bam_marsh, rep = 100, method = "simulate")
+
+# ============================================================
+# 7. Fitted BAM curves (averaged over polygon random effects)
+# ============================================================
+z_seq_pred <- seq(min(pixel_sub$z), max(pixel_sub$z), length.out = 1000)
+
+pred_grid <- expand.grid(
+  z          = z_seq_pred,
+  Management = levels(pixel_sub$Management),
+  ID         = levels(pixel_sub$ID)
+) %>%
+  mutate(
+    Management = factor(Management, levels = levels(pixel_sub$Management)),
+    ID         = factor(ID,         levels = levels(pixel_sub$ID))
+  )
+
+pred <- predict(bam_marsh, newdata = pred_grid, type = "response", se.fit = TRUE)
+pred_grid$fit <- pred$fit
+pred_grid$se  <- pred$se.fit
+
+pred_avg <- pred_grid %>%
+  group_by(Management, z) %>%
+  summarise(
+    fit = mean(fit),
+    se  = sqrt(mean(se^2)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    upper = fit + 2 * se,
+    lower = fit - 2 * se
+  )
+
+# ============================================================
+# 8. Residuals
+# ============================================================
+pixel_sub$resid <- residuals(bam_marsh)
+
+pixel_var_resid <- pixel_sub %>%
+  group_by(Management) %>%
+  summarise(
+    var_resid = var(resid),
+    sd_resid  = sd(resid),
+    n         = n(),
+    .groups   = "drop"
+  )
+print(pixel_var_resid)
+
+fligner.test(resid ~ Management, data = pixel_sub)
+
+ggplot(pixel_sub, aes(fitted(bam_marsh), abs(resid))) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  labs(x = "Fitted values", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+ggplot(pixel_sub, aes(z, abs(resid), color = Management)) +
+  geom_point(alpha = 0.1) + geom_smooth() +
+  scale_color_manual(values = c("NBS" = "#99CC33", "Conventional" = "#39b54a")) +
+  labs(x = "Elevation z (2016)", y = "Absolute residuals") +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# 9. ECDF of 2022 elevation with crossing points
+# ============================================================
+elev_2022 <- wide_df %>%
+  mutate(elev_2022 = as.numeric(`2022`)) %>%
+  select(ID, Management, elev_2022) %>%
+  filter(!is.na(elev_2022)) %>%
+  mutate(Management = factor(Management))
+
+pixel_NBS_2022  <- elev_2022 %>% filter(Management == "NBS")          %>% pull(elev_2022)
+pixel_Conv_2022 <- elev_2022 %>% filter(Management == "Conventional") %>% pull(elev_2022)
+
+cdf_NBS_2022  <- ecdf(pixel_NBS_2022)
+cdf_Conv_2022 <- ecdf(pixel_Conv_2022)
+
+z_vals    <- seq(min(c(pixel_NBS_2022, pixel_Conv_2022)),
+                 max(c(pixel_NBS_2022, pixel_Conv_2022)),
+                 length.out = 1000)
+diff_cdf  <- cdf_NBS_2022(z_vals) - cdf_Conv_2022(z_vals)
+cross_idx <- which(diff_cdf[-1] * diff_cdf[-length(diff_cdf)] < 0)
+
+cross_points <- sapply(cross_idx, function(i) {
+  x1 <- z_vals[i];   x2 <- z_vals[i + 1]
+  y1 <- diff_cdf[i]; y2 <- diff_cdf[i + 1]
+  x1 - y1 * (x2 - x1) / (y2 - y1)
+})
+
+cross_table <- data.frame(
+  z_cross   = cross_points,
+  cdf_value = cdf_NBS_2022(cross_points)
+)
+print(cross_table)
+
+ecdf_plot_2022 <- ggplot(elev_2022, aes(x = elev_2022, color = Management)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(values = c("NBS" = "#99CC33", "Conventional" = "#39b54a")) +
+  geom_point(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points)),
+    aes(x = z, y = y), color = "red", size = 3, shape = 21, fill = "yellow",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(z = cross_points, y = cdf_NBS_2022(cross_points),
+                      label = round(cross_points, 2)),
+    aes(x = z, y = y, label = label),
+    vjust = -1, color = "red", size = 3, inherit.aes = FALSE
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(title = "ECDF of Pixel Elevation z (2022) by Management",
+       x = "Elevation z (2022) [m]", y = "Cumulative proportion",
+       color = "Management") +
+  theme(legend.position = "top")
+
+print(ecdf_plot_2022)
+
+# ============================================================
+# 10. Bin comparison table
+# ============================================================
+bin_compare_table <- pred_avg %>%
+  mutate(z_bin = floor(z / 0.5) * 0.5) %>%
+  group_by(Management, z_bin) %>%
+  summarise(mean_dz = mean(fit), .groups = "drop") %>%
+  pivot_wider(names_from = Management, values_from = mean_dz) %>%
+  mutate(
+    diff_NBS_minus_Conv = NBS - Conventional,
+    Advantage = case_when(
+      diff_NBS_minus_Conv > 0 ~ "NBS higher accretion",
+      diff_NBS_minus_Conv < 0 ~ "Conventional higher accretion",
+      TRUE                    ~ "Equal"
+    )
+  ) %>%
+  arrange(z_bin)
+print(bin_compare_table)
+
+# ============================================================
+# 11. Trapezoidal integration
+# ============================================================
+curve_wide <- pred_avg %>%
+  select(z, Management, fit) %>%
+  pivot_wider(names_from = Management, values_from = fit) %>%
+  arrange(z)
+
+z_step <- diff(curve_wide$z)
+
+I_NBS  <- sum((curve_wide$NBS[-1]          + curve_wide$NBS[-nrow(curve_wide)])          / 2 * z_step)
+I_Conv <- sum((curve_wide$Conventional[-1] + curve_wide$Conventional[-nrow(curve_wide)]) / 2 * z_step)
+z_range <- diff(range(curve_wide$z))
+
+integral_table <- data.frame(
+  Management          = c("NBS", "Conventional"),
+  Integral            = round(c(I_NBS, I_Conv), 4),
+  Normalized_integral = round(c(I_NBS / z_range, I_Conv / z_range), 4)
+)
+print(integral_table)
+
+diff_table <- data.frame(
+  Metric = c("Integral difference (NBS - Conv)", "Normalized difference (NBS - Conv)",
+             "Integral ratio (NBS / Conv)",      "Normalized ratio (NBS / Conv)"),
+  Value  = round(c(I_NBS - I_Conv,
+                   I_NBS / z_range - I_Conv / z_range,
+                   I_NBS / I_Conv,
+                   (I_NBS / z_range) / (I_Conv / z_range)), 4)
+)
+print(diff_table)
+
+# ============================================================
+# 12. Final combined plot
+# ============================================================
+bin_width <- 0.5
+xmin      <- -1.5
+xmax      <- 3
+slr_m     <- 2.9 / 1000
+colors    <- c("Embanked" = "#39b54a", "NBS" = "#99CC33")
+
+pred_avg_plot <- pred_avg %>%
+  mutate(Management = recode(Management, "Conventional" = "Embanked"))
+
+pixel_sub_plot <- pixel_sub %>%
+  mutate(Management = recode(Management, "Conventional" = "Embanked")) %>%
+  mutate(
+    z_bin      = floor(z / bin_width) * bin_width,
+    bin_center = z_bin + bin_width / 2,
+    bin_factor = factor(bin_center)
+  )
+
+x_ticks <- seq(xmin, xmax, by = 0.5)
+
+x_grid_theme <- theme(
+  panel.grid.major.x = element_line(colour = "grey80", linewidth = 0.4),
+  panel.grid.minor   = element_blank()
+)
+
+# ── Top panel: BAM curves ─────────────────────────────────────
+bam_curve_plot <- ggplot(pred_avg_plot,
+                         aes(x = z, y = fit, color = Management, fill = Management)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.25, colour = NA) +
+  geom_line(linewidth = 1.3) +
+  geom_hline(yintercept = 0,     linewidth = 0.9, colour = "black") +
+  geom_hline(yintercept = slr_m, linewidth = 0.9, colour = "red", linetype = "dashed") +
+  annotate("text", x = xmax, y = slr_m,
+           label = "Current SLR = 2.9 mm yr\u207b\u00b9",
+           colour = "red", hjust = 1, vjust = -0.6, size = 4) +
+  geom_point(
+    data = data.frame(z = c(1.16, 1.80), dz = c(0.0062, 0.0041)),
+    aes(x = z, y = dz), colour = "#03A9FF", size = 3, inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(
+      z     = c(1.16, 1.80),
+      dz    = c(0.0062, 0.0041),
+      label = c("Kroon's Polders (Wolters et al. 2005)",
+                "Langeoog sommerpolder (Frölich 2015)")
+    ),
+    aes(x = z, y = dz, label = label),
+    colour = "#03A9FF", hjust = -0.05, vjust = -0.6, size = 4,
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = colors) +
+  scale_fill_manual(values  = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse(limits = c(0.01, -0.03)) +
+  labs(y = expression(Delta * "Z (m yr"^-1 * ")"), x = NULL) +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position    = "top",
+    axis.text.x        = element_blank(),
+    axis.ticks.x       = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80"),
+    plot.margin        = margin(5, 5, 10, 5)
+  )
+
+# ── Middle panel: residual boxplots ───────────────────────────
+resid_boxplot <- ggplot(pixel_sub_plot,
+                        aes(x = bin_center, y = resid,
+                            group = interaction(bin_factor, Management),
+                            fill  = Management)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6, colour = "grey40") +
+  geom_boxplot(
+    position      = position_dodge(width = bin_width * 0.9),
+    width         = bin_width * 0.8,
+    linewidth     = 0.4,
+    outlier.shape = NA,
+    alpha         = 0.85
+  ) +
+  scale_fill_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse(breaks = scales::pretty_breaks(n = 4)) +
+  labs(x = NULL, y = "Residuals (m/year)") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank(),
+    plot.margin     = margin(5, 5, 10, 5)
+  )
+
+# ── Bottom panel: density ─────────────────────────────────────
+pdf_plot <- ggplot(pixel_sub_plot,
+                   aes(x = z, fill = Management, colour = Management)) +
+  geom_density(
+    aes(y = after_stat(density)),
+    alpha     = 0.25,
+    linewidth = 1.0,
+    position  = "identity"
+  ) +
+  scale_fill_manual(values  = colors) +
+  scale_color_manual(values = colors) +
+  coord_cartesian(xlim = c(xmin, xmax)) +
+  scale_x_continuous(breaks = x_ticks, expand = c(0, 0)) +
+  scale_y_reverse() +
+  labs(x = "Elevation z (2016) [m]", y = "Normalized density") +
+  theme_minimal(base_size = 14) +
+  x_grid_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(size = 9),
+    plot.margin     = margin(5, 5, 5, 5)
+  )
+
+# ── Combine ───────────────────────────────────────────────────
+combined_plot <- bam_curve_plot /
+                 resid_boxplot  /
+                 pdf_plot +
+                 plot_layout(heights = c(2, 1, 0.8))
+
+combined_plot
+
+```
